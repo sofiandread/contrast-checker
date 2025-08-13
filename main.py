@@ -6,9 +6,22 @@ import io, math, urllib.request, json
 import numpy as np
 from PIL import Image
 
-app = FastAPI(title="ContrastCheck API", version="1.2.0")
+app = FastAPI(title="ContrastCheck API", version="1.3.0")
 
-# ============= Helpers =============
+# ========= Utilities =========
+
+def to_py(obj):
+    """Recursively convert NumPy scalars/arrays to plain Python types for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: to_py(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        t = [to_py(v) for v in obj]
+        return type(obj)(t) if isinstance(obj, tuple) else t
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
 
 def srgb_to_linear(c: np.ndarray) -> np.ndarray:
     c = c / 255.0
@@ -39,14 +52,14 @@ def clamp_box(x, y, w, h, W, H):
     return x, y, w, h
 
 def pil_from_url(url: str) -> Image.Image:
-    """Robust image fetcher: upgrades http→https, sets UA, handles timeouts; returns RGB PIL image."""
+    """Robust fetcher: upgrades http→https, sets UA, handles timeouts; returns RGB PIL image."""
     try:
         if url.startswith("http://"):
             url = "https://" + url[len("http://"):]
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "ContrastCheck/1.2 (+fastapi)",
+                "User-Agent": "ContrastCheck/1.3 (+fastapi)",
                 "Accept": "image/*,*/*;q=0.8",
             },
         )
@@ -142,7 +155,7 @@ def split_border_inner(arr: np.ndarray, border_pct: float) -> Tuple[np.ndarray, 
     inner = arr[t:H - t, t:W - t, :].reshape(-1, 3)
     return border, inner
 
-# ============= Models =============
+# ========= Models =========
 
 class Box(BaseModel):
     x: int; y: int; w: int; h: int
@@ -173,14 +186,11 @@ class CutoutRequest(BaseModel):
     border_pct: float = 0.12
     thresholds: Optional[Thresholds] = Thresholds()
 
-# ============= Routes =============
+# ========= Routes =========
 
 @app.get("/")
 def root():
-    return {
-        "ok": True,
-        "endpoints": ["/contrastcheck_upload", "/contrastcheck_cutout", "/contrastcheck", "/docs"]
-    }
+    return {"ok": True, "endpoints": ["/contrastcheck_upload", "/contrastcheck_cutout", "/contrastcheck", "/docs"]}
 
 # ---- BOX MODE (image URL + boxes) ----
 @app.post("/contrastcheck")
@@ -206,15 +216,15 @@ def contrastcheck(req: RequestBoxMode):
         design_palette = kmeans_palette(design_pixels, k_min=2, k_max=8)
         for c in design_palette:
             c["hex"] = to_hex(tuple(c["rgb"]))
-            c["luminance"] = round(relative_luminance(tuple(c["rgb"])), 6)
+            c["luminance"] = float(round(relative_luminance(tuple(c["rgb"])), 6))
 
         g_vs_d = []
         for c in design_palette:
-            ratio = round(contrast_ratio(g_rgb, tuple(c["rgb"])), 3)
+            ratio = float(round(contrast_ratio(g_rgb, tuple(c["rgb"])), 3))
             g_vs_d.append({
                 "designHex": c["hex"], "designRGB": c["rgb"], "ratio": ratio,
-                "pass": ratio >= req.thresholds.min_garment_vs_design,
-                "borderline": (ratio >= req.thresholds.min_garment_vs_design and ratio < req.thresholds.warn_garment_vs_design),
+                "pass": bool(ratio >= req.thresholds.min_garment_vs_design),
+                "borderline": bool(ratio >= req.thresholds.min_garment_vs_design and ratio < req.thresholds.warn_garment_vs_design),
             })
 
         intra = []
@@ -222,10 +232,10 @@ def contrastcheck(req: RequestBoxMode):
         for i in range(len(dp)):
             for j in range(i + 1, len(dp)):
                 a = tuple(dp[i]["rgb"]); b = tuple(dp[j]["rgb"])
-                ratio = round(contrast_ratio(a, b), 3)
+                ratio = float(round(contrast_ratio(a, b), 3))
                 intra.append({
                     "a": dp[i]["hex"], "b": dp[j]["hex"], "ratio": ratio,
-                    "pass": ratio >= req.thresholds.min_intra_design,
+                    "pass": bool(ratio >= req.thresholds.min_intra_design),
                 })
 
         failing_garment_pairs = [p for p in g_vs_d if not p["pass"]]
@@ -245,7 +255,7 @@ def contrastcheck(req: RequestBoxMode):
 
         results.append({
             "location_id": loc.location_id,
-            "garment": {"rgb": list(g_rgb), "hex": g_hex, "luminance": round(g_lum, 6)},
+            "garment": {"rgb": list(g_rgb), "hex": g_hex, "luminance": float(round(g_lum, 6))},
             "designPalette": design_palette,
             "contrast": {"garmentVsDesign": g_vs_d, "intraDesignPairs": intra},
             "thresholdsUsed": req.thresholds.dict(),
@@ -253,7 +263,7 @@ def contrastcheck(req: RequestBoxMode):
             "notes": notes,
         })
 
-    return {"contrastcheck": {"image_url": req.image_url, "results": results}}
+    return to_py({"contrastcheck": {"image_url": req.image_url, "results": results}})
 
 # ---- CUTOUT MODE (URL, garment from border ring) ----
 @app.post("/contrastcheck_cutout")
@@ -274,24 +284,24 @@ def contrastcheck_cutout(req: CutoutRequest):
             raise HTTPException(400, "Unable to derive design palette from inner area")
         for c in design_palette:
             c["hex"] = to_hex(tuple(c["rgb"]))
-            c["luminance"] = round(relative_luminance(tuple(c["rgb"])), 6)
+            c["luminance"] = float(round(relative_luminance(tuple(c["rgb"])), 6))
 
         g_vs_d, intra = [], []
         for c in design_palette:
-            ratio = round(contrast_ratio(g_rgb, tuple(c["rgb"])), 3)
+            ratio = float(round(contrast_ratio(g_rgb, tuple(c["rgb"])), 3))
             g_vs_d.append({
                 "designHex": c["hex"], "designRGB": c["rgb"], "ratio": ratio,
-                "pass": ratio >= req.thresholds.min_garment_vs_design,
-                "borderline": (ratio >= req.thresholds.min_garment_vs_design and ratio < req.thresholds.warn_garment_vs_design),
+                "pass": bool(ratio >= req.thresholds.min_garment_vs_design),
+                "borderline": bool(ratio >= req.thresholds.min_garment_vs_design and ratio < req.thresholds.warn_garment_vs_design),
             })
 
         for i in range(len(design_palette)):
             for j in range(i + 1, len(design_palette)):
                 a = tuple(design_palette[i]["rgb"]); b = tuple(design_palette[j]["rgb"])
-                ratio = round(contrast_ratio(a, b), 3)
+                ratio = float(round(contrast_ratio(a, b), 3))
                 intra.append({
                     "a": design_palette[i]["hex"], "b": design_palette[j]["hex"], "ratio": ratio,
-                    "pass": ratio >= req.thresholds.min_intra_design,
+                    "pass": bool(ratio >= req.thresholds.min_intra_design),
                 })
 
         failing_g = [p for p in g_vs_d if not p["pass"]]
@@ -306,14 +316,14 @@ def contrastcheck_cutout(req: CutoutRequest):
 
         result = {
             "cutout_id": req.cutout_id,
-            "garment": {"rgb": list(g_rgb), "hex": g_hex, "luminance": round(g_lum, 6)},
+            "garment": {"rgb": list(g_rgb), "hex": g_hex, "luminance": float(round(g_lum, 6))},
             "designPalette": design_palette,
             "contrast": {"garmentVsDesign": g_vs_d, "intraDesignPairs": intra},
             "thresholdsUsed": req.thresholds.dict(),
             "contrastVerdict": verdict,
             "notes": notes,
         }
-        return {"contrastcheck": {"cutout_url": req.cutout_url, "results": [result]}}
+        return to_py({"contrastcheck": {"cutout_url": req.cutout_url, "results": [result]}})
     except HTTPException:
         raise
     except Exception as e:
@@ -329,30 +339,25 @@ async def contrastcheck_upload(
     thresholds_json: Optional[str] = Form(None),
 ):
     try:
-        # pick whichever field arrived
+        # accept either 'file' or 'cutout' field name
         upload = file or cutout
         if upload is None:
             raise HTTPException(400, "No file uploaded. Expected field named 'file' or 'cutout'.")
 
-        # thresholds (with safe defaults)
+        # thresholds with safe defaults
         t = {"min_garment_vs_design": 3.0, "warn_garment_vs_design": 3.4, "min_intra_design": 2.5}
         if thresholds_json:
-            import json
             try:
                 t.update(json.loads(thresholds_json))
             except Exception as e:
                 raise HTTPException(400, f"Invalid thresholds_json: {e}")
 
-        # read image
         data = await upload.read()
-        from PIL import Image
         img = Image.open(io.BytesIO(data)).convert("RGB")
         arr = np.array(img)
 
-        # ring split
         border_px, inner_px = split_border_inner(arr, float(border_pct))
 
-        # palettes
         garment_palette = kmeans_palette(border_px, k_min=1, k_max=3)
         if not garment_palette:
             raise HTTPException(400, "Unable to derive garment palette from border")
@@ -364,24 +369,24 @@ async def contrastcheck_upload(
             raise HTTPException(400, "Unable to derive design palette from inner area")
         for c in design_palette:
             c["hex"] = to_hex(tuple(c["rgb"]))
-            c["luminance"] = round(relative_luminance(tuple(c["rgb"])), 6)
+            c["luminance"] = float(round(relative_luminance(tuple(c["rgb"])), 6))
 
-        # contrasts
         g_vs_d, intra = [], []
         for c in design_palette:
-            ratio = round(contrast_ratio(g_rgb, tuple(c["rgb"])), 3)
+            ratio = float(round(contrast_ratio(g_rgb, tuple(c["rgb"])), 3))
             g_vs_d.append({
                 "designHex": c["hex"], "designRGB": c["rgb"], "ratio": ratio,
-                "pass": ratio >= t["min_garment_vs_design"],
-                "borderline": (ratio >= t["min_garment_vs_design"] and ratio < t["warn_garment_vs_design"]),
+                "pass": bool(ratio >= t["min_garment_vs_design"]),
+                "borderline": bool(ratio >= t["min_garment_vs_design"] and ratio < t["warn_garment_vs_design"]),
             })
+
         for i in range(len(design_palette)):
             for j in range(i + 1, len(design_palette)):
                 a = tuple(design_palette[i]["rgb"]); b = tuple(design_palette[j]["rgb"])
-                ratio = round(contrast_ratio(a, b), 3)
+                ratio = float(round(contrast_ratio(a, b), 3))
                 intra.append({
                     "a": design_palette[i]["hex"], "b": design_palette[j]["hex"], "ratio": ratio,
-                    "pass": ratio >= t["min_intra_design"],
+                    "pass": bool(ratio >= t["min_intra_design"]),
                 })
 
         failing_g = [p for p in g_vs_d if not p["pass"]]
@@ -396,17 +401,15 @@ async def contrastcheck_upload(
 
         result = {
             "cutout_id": cutout_id,
-            "garment": {"rgb": list(g_rgb), "hex": g_hex, "luminance": round(g_lum, 6)},
+            "garment": {"rgb": list(g_rgb), "hex": g_hex, "luminance": float(round(g_lum, 6))},
             "designPalette": design_palette,
             "contrast": {"garmentVsDesign": g_vs_d, "intraDesignPairs": intra},
             "thresholdsUsed": t,
             "contrastVerdict": verdict,
             "notes": notes,
         }
-        return {"contrastcheck": {"results": [result]}}
+        return to_py({"contrastcheck": {"results": [result]}})
     except HTTPException:
         raise
     except Exception as e:
-        # return a readable error instead of a 500
         raise HTTPException(status_code=400, detail=f"Processing error: {e}")
-

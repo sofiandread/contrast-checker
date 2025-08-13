@@ -322,28 +322,37 @@ def contrastcheck_cutout(req: CutoutRequest):
 # ---- UPLOAD MODE (multipart cutout PNG) ----
 @app.post("/contrastcheck_upload")
 async def contrastcheck_upload(
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    cutout: UploadFile | None = File(None),
     cutout_id: Optional[str] = Form(None),
     border_pct: float = Form(0.12),
     thresholds_json: Optional[str] = Form(None),
 ):
     try:
+        # pick whichever field arrived
+        upload = file or cutout
+        if upload is None:
+            raise HTTPException(400, "No file uploaded. Expected field named 'file' or 'cutout'.")
+
         # thresholds (with safe defaults)
         t = {"min_garment_vs_design": 3.0, "warn_garment_vs_design": 3.4, "min_intra_design": 2.5}
         if thresholds_json:
+            import json
             try:
                 t.update(json.loads(thresholds_json))
             except Exception as e:
                 raise HTTPException(400, f"Invalid thresholds_json: {e}")
 
         # read image
-        data = await file.read()
+        data = await upload.read()
+        from PIL import Image
         img = Image.open(io.BytesIO(data)).convert("RGB")
         arr = np.array(img)
 
         # ring split
         border_px, inner_px = split_border_inner(arr, float(border_pct))
 
+        # palettes
         garment_palette = kmeans_palette(border_px, k_min=1, k_max=3)
         if not garment_palette:
             raise HTTPException(400, "Unable to derive garment palette from border")
@@ -357,6 +366,7 @@ async def contrastcheck_upload(
             c["hex"] = to_hex(tuple(c["rgb"]))
             c["luminance"] = round(relative_luminance(tuple(c["rgb"])), 6)
 
+        # contrasts
         g_vs_d, intra = [], []
         for c in design_palette:
             ratio = round(contrast_ratio(g_rgb, tuple(c["rgb"])), 3)
@@ -365,7 +375,6 @@ async def contrastcheck_upload(
                 "pass": ratio >= t["min_garment_vs_design"],
                 "borderline": (ratio >= t["min_garment_vs_design"] and ratio < t["warn_garment_vs_design"]),
             })
-
         for i in range(len(design_palette)):
             for j in range(i + 1, len(design_palette)):
                 a = tuple(design_palette[i]["rgb"]); b = tuple(design_palette[j]["rgb"])
@@ -398,4 +407,6 @@ async def contrastcheck_upload(
     except HTTPException:
         raise
     except Exception as e:
+        # return a readable error instead of a 500
         raise HTTPException(status_code=400, detail=f"Processing error: {e}")
+

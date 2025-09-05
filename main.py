@@ -1,12 +1,12 @@
 # main.py
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Tuple, Dict
 import io, math, urllib.request, json
 import numpy as np
 from PIL import Image
 
-app = FastAPI(title="ContrastCheck API", version="1.4.0")
+app = FastAPI(title="ContrastCheck API", version="1.5.0")
 
 # ========= Utilities =========
 
@@ -27,9 +27,9 @@ def srgb_to_linear(c: np.ndarray) -> np.ndarray:
     c = c / 255.0
     thresh = 0.04045
     low = c <= thresh
-    high = ~low
     out = np.zeros_like(c, dtype=np.float64)
     out[low] = c[low] / 12.92
+    high = ~low
     out[high] = ((c[high] + 0.055) / 1.055) ** 2.4
     return out
 
@@ -59,7 +59,7 @@ def pil_from_url(url: str) -> Image.Image:
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "ContrastCheck/1.4 (+fastapi)",
+                "User-Agent": "ContrastCheck/1.5 (+fastapi)",
                 "Accept": "image/*,*/*;q=0.8",
             },
         )
@@ -155,35 +155,45 @@ def split_border_inner(arr: np.ndarray, border_pct: float) -> Tuple[np.ndarray, 
     inner = arr[t:H - t, t:W - t, :].reshape(-1, 3)
     return border, inner
 
+# ---- New helpers for leniency / overall look ----
+
+def coverage_adjusted_threshold(pct: float, base: float, floor: float = 2.2) -> float:
+    """
+    Lower the required contrast for small accent colors; keep dominant colors strict.
+    >=25% coverage -> base; 10–25% -> base-0.4; <10% -> base-0.8 (never below 'floor').
+    """
+    pct = float(pct or 0.0)
+    if pct >= 0.25:
+        return base
+    elif pct >= 0.10:
+        return max(floor, base - 0.4)
+    else:
+        return max(floor, base - 0.8)
+
 def weighted_contrast_stats(
     g_rgb: Tuple[int, int, int],
     design_palette: List[Dict],
     threshold: float
 ) -> Dict[str, float]:
-    """Coverage-weighted stats to soften verdicts when only small accents fail."""
+    """Coverage-weighted stats to judge overall look."""
     ratios, weights = [], []
     for c in design_palette:
         r = contrast_ratio(g_rgb, tuple(c["rgb"]))
         ratios.append(r)
         weights.append(float(c.get("percent", 0.0)) or 0.0)
-
     if not ratios:
         return {"weighted_mean": 0.0, "weighted_p25": 0.0, "fail_coverage": 1.0, "ratios": []}
 
     r = np.asarray(ratios, dtype=np.float64)
     w = np.asarray(weights, dtype=np.float64)
-    if w.sum() <= 0:
-        w = np.ones_like(r) / len(r)
-    else:
-        w = w / w.sum()
+    w = w / (w.sum() or 1.0)
 
     weighted_mean = float((w * r).sum())
 
     order = np.argsort(r)
     r_sorted = r[order]; w_sorted = w[order]
     cw = np.cumsum(w_sorted)
-    p = 0.25
-    idx = int(np.searchsorted(cw, p))
+    idx = int(np.searchsorted(cw, 0.25))
     idx = min(max(idx, 0), len(r_sorted) - 1)
     weighted_p25 = float(r_sorted[idx])
 
@@ -196,6 +206,47 @@ def weighted_contrast_stats(
         "ratios": [float(round(x, 3)) for x in r.tolist()],
     }
 
+def overall_contrast_verdict(
+    g_vs_d: List[Dict],
+    stats: Dict[str, float],
+    base_min: float
+) -> Tuple[str, List[str]]:
+    """
+    Decide pass/warn/fail for overall look.
+    - Fail only when the *overall* picture is weak or a very-low contrast color is sizable.
+    - Otherwise warn when there are some misses/borderlines.
+    """
+    notes = []
+    # Severity gates (tunable)
+    MEAN_MARGIN_FAIL = 0.6      # fail if mean < base - 0.6
+    P25_MARGIN_FAIL  = 0.4      # fail if p25 < base - 0.4
+    FAIL_COVERAGE_MAX = 0.40    # fail if >40% of design is below base_min
+    EXTREME_LOW = max(2.1, base_min - 0.9)  # hard low threshold for single colors
+
+    # coverage is optional; treat missing as 0
+    extreme = [p for p in g_vs_d if p["ratio"] < EXTREME_LOW and float(p.get("coverage", 0) or 0) >= 0.10]
+    if extreme:
+        notes.append("one or more sizable colors are extremely low in contrast")
+
+    overall_fail = (
+        stats["weighted_mean"] < (base_min - MEAN_MARGIN_FAIL) or
+        stats["weighted_p25"]  < (base_min - P25_MARGIN_FAIL) or
+        stats["fail_coverage"] > FAIL_COVERAGE_MAX or
+        len(extreme) > 0
+    )
+
+    any_miss = any(p["ratio"] < p.get("required", base_min) for p in g_vs_d)
+    any_border = any(p.get("borderline") for p in g_vs_d)
+
+    if overall_fail:
+        verdict = "fail"
+    elif any_miss or any_border:
+        verdict = "warn"
+    else:
+        verdict = "pass"
+
+    return verdict, notes
+
 # ========= Models =========
 
 class Box(BaseModel):
@@ -205,16 +256,14 @@ class Location(BaseModel):
     location_id: str = Field(..., description="e.g., 'front', 'back', or 'loc1'")
     design_box: Box
     garment_box: Box
-    # Optional: regions that contain text; these will be checked with stricter thresholds and no leniency
-    text_boxes: Optional[List[Box]] = Field(default_factory=list)
+    text_boxes: Optional[List[Box]] = Field(default_factory=list)  # optional strict text checks
 
 class Thresholds(BaseModel):
-    # Non-text thresholds (kept same as before)
+    # Non-text thresholds
     min_garment_vs_design: float = 3.0
     warn_garment_vs_design: float = 3.4
     min_intra_design: float = 2.5
     # Text-specific thresholds (strict)
-    # Tune as desired: these are a bit stricter than the non-text ones
     min_text_vs_garment: float = 3.4
     warn_text_vs_garment: float = 4.0
 
@@ -222,7 +271,9 @@ class RequestBoxMode(BaseModel):
     image_url: str
     locations: List[Location]
     thresholds: Optional[Thresholds] = Thresholds()
-    @validator("locations")
+
+    @field_validator("locations")
+    @classmethod
     def non_empty(cls, v):
         if not v:
             raise ValueError("locations cannot be empty")
@@ -240,6 +291,50 @@ class CutoutRequest(BaseModel):
 def root():
     return {"ok": True, "endpoints": ["/contrastcheck_upload", "/contrastcheck_cutout", "/contrastcheck", "/docs"]}
 
+def build_checks(g_rgb, g_hex, design_palette, thresholds):
+    """Common garment-vs-design checks with coverage-aware thresholds and stats."""
+    # add hex/luminance to design swatches
+    for c in design_palette:
+        c["hex"] = to_hex(tuple(c["rgb"]))
+        c["luminance"] = float(round(relative_luminance(tuple(c["rgb"])), 6))
+
+    g_vs_d = []
+    for c in design_palette:
+        ratio = float(round(contrast_ratio(g_rgb, tuple(c["rgb"])), 3))
+        required = coverage_adjusted_threshold(c.get("percent", 0.0), thresholds.min_garment_vs_design)
+        warn_at = max(required, thresholds.warn_garment_vs_design)
+        g_vs_d.append({
+            "designHex": c["hex"],
+            "designRGB": c["rgb"],
+            "ratio": ratio,
+            "required": float(round(required, 3)),
+            "pass": bool(ratio >= required),
+            "borderline": bool(ratio >= required and ratio < warn_at),
+            "coverage": c.get("percent", 0.0),
+        })
+
+    stats = weighted_contrast_stats(g_rgb, design_palette, thresholds.min_garment_vs_design)
+    return g_vs_d, stats
+
+def text_checks(img: Image.Image, boxes: List[Box], g_rgb: Tuple[int,int,int], thresholds: Thresholds, W: int, H: int):
+    out = []
+    for tb in (boxes or []):
+        tx, ty, tw, th = clamp_box(tb.x, tb.y, tb.w, tb.h, W, H)
+        text_pixels = sample_region_pixels(img, (tx, ty, tw, th))
+        if text_pixels.size == 0:
+            continue
+        text_palette = kmeans_palette(text_pixels, k_min=1, k_max=5)
+        for c in text_palette:
+            c["hex"] = to_hex(tuple(c["rgb"]))
+        for c in text_palette:
+            ratio = float(round(contrast_ratio(g_rgb, tuple(c["rgb"])), 3))
+            out.append({
+                "textHex": c["hex"], "textRGB": c["rgb"], "ratio": ratio,
+                "pass": bool(ratio >= thresholds.min_text_vs_garment),
+                "borderline": bool(ratio >= thresholds.min_text_vs_garment and ratio < thresholds.warn_text_vs_garment),
+            })
+    return out
+
 # ---- BOX MODE (image URL + boxes) ----
 @app.post("/contrastcheck")
 def contrastcheck(req: RequestBoxMode):
@@ -251,6 +346,7 @@ def contrastcheck(req: RequestBoxMode):
         dx, dy, dw, dh = clamp_box(loc.design_box.x, loc.design_box.y, loc.design_box.w, loc.design_box.h, W, H)
         gx, gy, gw, gh = clamp_box(loc.garment_box.x, loc.garment_box.y, loc.garment_box.w, loc.garment_box.h, W, H)
 
+        # garment
         garment_pixels = sample_region_pixels(img, (gx, gy, gw, gh))
         if garment_pixels.size == 0:
             raise HTTPException(400, f"Empty garment region for {loc.location_id}")
@@ -258,109 +354,65 @@ def contrastcheck(req: RequestBoxMode):
         g_rgb = tuple(garment_palette[0]["rgb"]); g_hex = to_hex(g_rgb)
         g_lum = relative_luminance(g_rgb)
 
+        # design
         design_pixels = sample_region_pixels(img, (dx, dy, dw, dh))
         if design_pixels.size == 0:
             raise HTTPException(400, f"Empty design region for {loc.location_id}")
         design_palette = kmeans_palette(design_pixels, k_min=2, k_max=8)
-        for c in design_palette:
-            c["hex"] = to_hex(tuple(c["rgb"]))
-            c["luminance"] = float(round(relative_luminance(tuple(c["rgb"])), 6))
 
-        g_vs_d = []
-        for c in design_palette:
-            ratio = float(round(contrast_ratio(g_rgb, tuple(c["rgb"])), 3))
-            g_vs_d.append({
-                "designHex": c["hex"], "designRGB": c["rgb"], "ratio": ratio,
-                "pass": bool(ratio >= req.thresholds.min_garment_vs_design),
-                "borderline": bool(ratio >= req.thresholds.min_garment_vs_design and ratio < req.thresholds.warn_garment_vs_design),
-            })
+        g_vs_d, stats = build_checks(g_rgb, g_hex, design_palette, req.thresholds)
 
+        # intra design pairs (kept for notes; do NOT fail unless extremely low and large)
         intra = []
-        dp = design_palette
+        dp = [{"hex": to_hex(tuple(c["rgb"])), "rgb": c["rgb"]} for c in design_palette]
         for i in range(len(dp)):
             for j in range(i + 1, len(dp)):
                 a = tuple(dp[i]["rgb"]); b = tuple(dp[j]["rgb"])
                 ratio = float(round(contrast_ratio(a, b), 3))
-                intra.append({
-                    "a": dp[i]["hex"], "b": dp[j]["hex"], "ratio": ratio,
-                    "pass": bool(ratio >= req.thresholds.min_intra_design),
-                })
+                intra.append({"a": dp[i]["hex"], "b": dp[j]["hex"], "ratio": ratio,
+                              "pass": bool(ratio >= req.thresholds.min_intra_design)})
 
-        failing_garment_pairs = [p for p in g_vs_d if not p["pass"]]
-        intra_fail = [p for p in intra if not p["pass"]]
-
-        # --- overall-look stats & leniency (only for non-text) ---
-        stats = weighted_contrast_stats(g_rgb, design_palette, req.thresholds.min_garment_vs_design)
-
-        # Tunable leniency knobs
-        LENIENCY_FAIL_COVERAGE_MAX = 0.20   # <=20% of design area may fail
-        LENIENCY_MEAN_MARGIN       = 0.50   # mean within 0.5 of threshold
-        LENIENCY_P25_MARGIN        = 0.30   # p25 within 0.3 of threshold
-
-        has_hard_fail = bool(failing_garment_pairs)
-        has_intra_fail = bool(intra_fail)
-
-        eligible_for_leniency = (
-            has_hard_fail and
-            stats["fail_coverage"] <= LENIENCY_FAIL_COVERAGE_MAX and
-            (stats["weighted_mean"] >= (req.thresholds.min_garment_vs_design - LENIENCY_MEAN_MARGIN)) and
-            (stats["weighted_p25"]  >= (req.thresholds.min_garment_vs_design - LENIENCY_P25_MARGIN))
-        )
-
-        # ---- Text-specific checks (strict; no leniency) ----
-        text_results = []
-        for tb in (loc.text_boxes or []):
-            tx, ty, tw, th = clamp_box(tb.x, tb.y, tb.w, tb.h, W, H)
-            text_pixels = sample_region_pixels(img, (tx, ty, tw, th))
-            if text_pixels.size == 0:
-                continue
-            text_palette = kmeans_palette(text_pixels, k_min=1, k_max=5)
-            for c in text_palette:
-                c["hex"] = to_hex(tuple(c["rgb"]))
-            for c in text_palette:
-                ratio = float(round(contrast_ratio(g_rgb, tuple(c["rgb"])), 3))
-                text_results.append({
-                    "textHex": c["hex"], "textRGB": c["rgb"], "ratio": ratio,
-                    "pass": bool(ratio >= req.thresholds.min_text_vs_garment),
-                    "borderline": bool(ratio >= req.thresholds.min_text_vs_garment and ratio < req.thresholds.warn_text_vs_garment),
-                })
-
+        # strict text checks (if provided)
+        text_results = text_checks(img, loc.text_boxes, g_rgb, req.thresholds, W, H)
         text_fail = [p for p in text_results if not p["pass"]]
 
-        # ---- Verdict computation ----
+        # overall verdict (individual misses become suggestions)
+        overall_verdict, overall_notes = overall_contrast_verdict(
+            g_vs_d, stats, req.thresholds.min_garment_vs_design
+        )
+
+        # if text fails → fail regardless of overall
+        final_verdict = "fail" if text_fail else overall_verdict
+
+        # suggestions from individual misses (top 3), but do not mark as fail unless overall said so
+        misses = [p for p in g_vs_d if p["ratio"] < p["required"]]
+        suggestions = [
+            f"Improve contrast for {p['designHex']} vs {g_hex} (ratio {p['ratio']:.3f} < {p['required']:.1f})"
+            for p in sorted(misses, key=lambda x: x["ratio"])[:3]
+        ]
         if text_fail:
-            verdict = "fail"
-        elif has_intra_fail:
-            verdict = "fail"
-        elif has_hard_fail and not eligible_for_leniency:
-            verdict = "fail"
-        elif (any(p.get("borderline") for p in g_vs_d) or has_hard_fail or any(p.get("borderline") for p in text_results)):
-            verdict = "warn"
-        else:
-            verdict = "pass"
+            for p in text_fail[:3]:
+                suggestions.append(f"TEXT {p['textHex']} vs {g_hex} too low (ratio {p['ratio']:.3f} < {req.thresholds.min_text_vs_garment})")
 
         notes = []
-        for p in failing_garment_pairs:
-            notes.append(f"Design {p['designHex']} vs garment {g_hex} too low ({p['ratio']}<={req.thresholds.min_garment_vs_design})")
-        for p in intra_fail:
-            notes.append(f"Design colors {p['a']} vs {p['b']} too low ({p['ratio']}<={req.thresholds.min_intra_design})")
-        for p in text_fail:
-            notes.append(f"TEXT {p['textHex']} vs garment {g_hex} too low ({p['ratio']}<={req.thresholds.min_text_vs_garment})")
-
-        notes.append(f"Overall contrast stats: mean={stats['weighted_mean']}, p25={stats['weighted_p25']}, failing_coverage={stats['fail_coverage']}")
+        if suggestions:
+            notes.append("Suggestions: " + "; ".join(suggestions))
+        if overall_notes:
+            notes.extend(overall_notes)
+        notes.append(f"Overall stats: mean={stats['weighted_mean']}, p25={stats['weighted_p25']}, failing_coverage={stats['fail_coverage']}")
 
         results.append({
             "location_id": loc.location_id,
             "garment": {"rgb": list(g_rgb), "hex": g_hex, "luminance": float(round(g_lum, 6))},
             "designPalette": design_palette,
             "contrast": {
-                "garmentVsDesign": g_vs_d,
-                "intraDesignPairs": intra,
+                "garmentVsDesign": g_vs_d,           # informational; NOT used to fail unless extreme
+                "intraDesignPairs": intra,           # informational
                 "overallStats": stats,
                 "textChecks": text_results
             },
             "thresholdsUsed": req.thresholds.dict(),
-            "contrastVerdict": verdict,
+            "contrastVerdict": final_verdict,
             "notes": notes,
         })
 
@@ -383,52 +435,35 @@ def contrastcheck_cutout(req: CutoutRequest):
         design_palette = kmeans_palette(inner_px, k_min=2, k_max=8)
         if not design_palette:
             raise HTTPException(400, "Unable to derive design palette from inner area")
-        for c in design_palette:
-            c["hex"] = to_hex(tuple(c["rgb"]))
-            c["luminance"] = float(round(relative_luminance(tuple(c["rgb"])), 6))
 
-        g_vs_d, intra = [], []
-        for c in design_palette:
-            ratio = float(round(contrast_ratio(g_rgb, tuple(c["rgb"])), 3))
-            g_vs_d.append({
-                "designHex": c["hex"], "designRGB": c["rgb"], "ratio": ratio,
-                "pass": bool(ratio >= req.thresholds.min_garment_vs_design),
-                "borderline": bool(ratio >= req.thresholds.min_garment_vs_design and ratio < req.thresholds.warn_garment_vs_design),
-            })
+        g_vs_d, stats = build_checks(g_rgb, g_hex, design_palette, req.thresholds)
 
-        for i in range(len(design_palette)):
-            for j in range(i + 1, len(design_palette)):
-                a = tuple(design_palette[i]["rgb"]); b = tuple(design_palette[j]["rgb"])
+        # intra pairs (notes only)
+        intra = []
+        dp = [{"hex": to_hex(tuple(c["rgb"])), "rgb": c["rgb"]} for c in design_palette]
+        for i in range(len(dp)):
+            for j in range(i + 1, len(dp)):
+                a = tuple(dp[i]["rgb"]); b = tuple(dp[j]["rgb"])
                 ratio = float(round(contrast_ratio(a, b), 3))
-                intra.append({
-                    "a": design_palette[i]["hex"], "b": design_palette[j]["hex"], "ratio": ratio,
-                    "pass": bool(ratio >= req.thresholds.min_intra_design),
-                })
+                intra.append({"a": dp[i]["hex"], "b": dp[j]["hex"], "ratio": ratio,
+                              "pass": bool(ratio >= req.thresholds.min_intra_design)})
 
-        failing_g = [p for p in g_vs_d if not p["pass"]]
-        intra_fail = [p for p in intra if not p["pass"]]
-
-        # Overall-look leniency (applies to cutouts too)
-        stats = weighted_contrast_stats(g_rgb, design_palette, req.thresholds.min_garment_vs_design)
-        LENIENCY_FAIL_COVERAGE_MAX = 0.20
-        LENIENCY_MEAN_MARGIN       = 0.50
-        LENIENCY_P25_MARGIN        = 0.30
-        has_hard_fail = bool(failing_g)
-        eligible_for_leniency = (
-            has_hard_fail and
-            stats["fail_coverage"] <= LENIENCY_FAIL_COVERAGE_MAX and
-            (stats["weighted_mean"] >= (req.thresholds.min_garment_vs_design - LENIENCY_MEAN_MARGIN)) and
-            (stats["weighted_p25"]  >= (req.thresholds.min_garment_vs_design - LENIENCY_P25_MARGIN))
+        overall_verdict, overall_notes = overall_contrast_verdict(
+            g_vs_d, stats, req.thresholds.min_garment_vs_design
         )
 
-        verdict = "fail" if (intra_fail or (has_hard_fail and not eligible_for_leniency)) else ("warn" if (any(p["borderline"] for p in g_vs_d) or has_hard_fail) else "pass")
+        misses = [p for p in g_vs_d if p["ratio"] < p["required"]]
+        suggestions = [
+            f"Improve contrast for {p['designHex']} vs {g_hex} (ratio {p['ratio']:.3f} < {p['required']:.1f})"
+            for p in sorted(misses, key=lambda x: x["ratio"])[:3]
+        ]
 
         notes = []
-        for p in failing_g:
-            notes.append(f"Design {p['designHex']} vs garment {g_hex} too low ({p['ratio']}<={req.thresholds.min_garment_vs_design})")
-        for p in intra_fail:
-            notes.append(f"Design colors {p['a']} vs {p['b']} too low ({p['ratio']}<={req.thresholds.min_intra_design})")
-        notes.append(f"Overall contrast stats: mean={stats['weighted_mean']}, p25={stats['weighted_p25']}, failing_coverage={stats['fail_coverage']}")
+        if suggestions:
+            notes.append("Suggestions: " + "; ".join(suggestions))
+        if overall_notes:
+            notes.extend(overall_notes)
+        notes.append(f"Overall stats: mean={stats['weighted_mean']}, p25={stats['weighted_p25']}, failing_coverage={stats['fail_coverage']}")
 
         result = {
             "cutout_id": req.cutout_id,
@@ -436,7 +471,7 @@ def contrastcheck_cutout(req: CutoutRequest):
             "designPalette": design_palette,
             "contrast": {"garmentVsDesign": g_vs_d, "intraDesignPairs": intra, "overallStats": stats},
             "thresholdsUsed": req.thresholds.dict(),
-            "contrastVerdict": verdict,
+            "contrastVerdict": overall_verdict,
             "notes": notes,
         }
         return to_py({"contrastcheck": {"cutout_url": req.cutout_url, "results": [result]}})
@@ -455,12 +490,11 @@ async def contrastcheck_upload(
     thresholds_json: Optional[str] = Form(None),
 ):
     try:
-        # accept either 'file' or 'cutout' field name
         upload = file or cutout
         if upload is None:
             raise HTTPException(400, "No file uploaded. Expected field named 'file' or 'cutout'.")
 
-        # thresholds with safe defaults (must mirror Thresholds defaults)
+        # thresholds with safe defaults (mirror Thresholds defaults)
         t = {
             "min_garment_vs_design": 3.0,
             "warn_garment_vs_design": 3.4,
@@ -477,7 +511,6 @@ async def contrastcheck_upload(
         data = await upload.read()
         img = Image.open(io.BytesIO(data)).convert("RGB")
         arr = np.array(img)
-
         border_px, inner_px = split_border_inner(arr, float(border_pct))
 
         garment_palette = kmeans_palette(border_px, k_min=1, k_max=3)
@@ -489,52 +522,42 @@ async def contrastcheck_upload(
         design_palette = kmeans_palette(inner_px, k_min=2, k_max=8)
         if not design_palette:
             raise HTTPException(400, "Unable to derive design palette from inner area")
-        for c in design_palette:
-            c["hex"] = to_hex(tuple(c["rgb"]))
-            c["luminance"] = float(round(relative_luminance(tuple(c["rgb"])), 6))
 
-        g_vs_d, intra = [], []
-        for c in design_palette:
-            ratio = float(round(contrast_ratio(g_rgb, tuple(c["rgb"])), 3))
-            g_vs_d.append({
-                "designHex": c["hex"], "designRGB": c["rgb"], "ratio": ratio,
-                "pass": bool(ratio >= t["min_garment_vs_design"]),
-                "borderline": bool(ratio >= t["min_garment_vs_design"] and ratio < t["warn_garment_vs_garment"] if "warn_garment_vs_garment" in t else ratio < t["warn_garment_vs_design"]),
-            })
+        # Build checks + overall verdict
+        class TObj:  # tiny shim so we can reuse build_checks
+            min_garment_vs_design=float(t["min_garment_vs_design"])
+            warn_garment_vs_design=float(t["warn_garment_vs_design"])
+            min_intra_design=float(t["min_intra_design"])
+            min_text_vs_garment=float(t["min_text_vs_garment"])
+            warn_text_vs_garment=float(t["warn_text_vs_garment"])
 
-        for i in range(len(design_palette)):
-            for j in range(i + 1, len(design_palette)):
-                a = tuple(design_palette[i]["rgb"]); b = tuple(design_palette[j]["rgb"])
+        g_vs_d, stats = build_checks(g_rgb, g_hex, design_palette, TObj)
+
+        intra = []
+        dp = [{"hex": to_hex(tuple(c["rgb"])), "rgb": c["rgb"]} for c in design_palette]
+        for i in range(len(dp)):
+            for j in range(i + 1, len(dp)):
+                a = tuple(dp[i]["rgb"]); b = tuple(dp[j]["rgb"])
                 ratio = float(round(contrast_ratio(a, b), 3))
-                intra.append({
-                    "a": design_palette[i]["hex"], "b": design_palette[j]["hex"], "ratio": ratio,
-                    "pass": bool(ratio >= t["min_intra_design"]),
-                })
+                intra.append({"a": dp[i]["hex"], "b": dp[j]["hex"], "ratio": ratio,
+                              "pass": bool(ratio >= t["min_intra_design"])})
 
-        failing_g = [p for p in g_vs_d if not p["pass"]]
-        intra_fail = [p for p in intra if not p["pass"]]
-
-        # Overall-look leniency
-        stats = weighted_contrast_stats(g_rgb, design_palette, t["min_garment_vs_design"])
-        LENIENCY_FAIL_COVERAGE_MAX = 0.20
-        LENIENCY_MEAN_MARGIN       = 0.50
-        LENIENCY_P25_MARGIN        = 0.30
-        has_hard_fail = bool(failing_g)
-        eligible_for_leniency = (
-            has_hard_fail and
-            stats["fail_coverage"] <= LENIENCY_FAIL_COVERAGE_MAX and
-            (stats["weighted_mean"] >= (t["min_garment_vs_design"] - LENIENCY_MEAN_MARGIN)) and
-            (stats["weighted_p25"]  >= (t["min_garment_vs_design"] - LENIENCY_P25_MARGIN))
+        overall_verdict, overall_notes = overall_contrast_verdict(
+            g_vs_d, stats, t["min_garment_vs_design"]
         )
 
-        verdict = "fail" if (intra_fail or (has_hard_fail and not eligible_for_leniency)) else ("warn" if (any(p["borderline"] for p in g_vs_d) or has_hard_fail) else "pass")
+        misses = [p for p in g_vs_d if p["ratio"] < p["required"]]
+        suggestions = [
+            f"Improve contrast for {p['designHex']} vs {g_hex} (ratio {p['ratio']:.3f} < {p['required']:.1f})"
+            for p in sorted(misses, key=lambda x: x["ratio"])[:3]
+        ]
 
         notes = []
-        for p in failing_g:
-            notes.append(f"Design {p['designHex']} vs garment {g_hex} too low ({p['ratio']}<={t['min_garment_vs_design']})")
-        for p in intra_fail:
-            notes.append(f"Design colors {p['a']} vs {p['b']} too low ({p['ratio']}<={t['min_intra_design']})")
-        notes.append(f"Overall contrast stats: mean={stats['weighted_mean']}, p25={stats['weighted_p25']}, failing_coverage={stats['fail_coverage']}")
+        if suggestions:
+            notes.append("Suggestions: " + "; ".join(suggestions))
+        if overall_notes:
+            notes.extend(overall_notes)
+        notes.append(f"Overall stats: mean={stats['weighted_mean']}, p25={stats['weighted_p25']}, failing_coverage={stats['fail_coverage']}")
 
         result = {
             "cutout_id": cutout_id,
@@ -542,7 +565,7 @@ async def contrastcheck_upload(
             "designPalette": design_palette,
             "contrast": {"garmentVsDesign": g_vs_d, "intraDesignPairs": intra, "overallStats": stats},
             "thresholdsUsed": t,
-            "contrastVerdict": verdict,
+            "contrastVerdict": overall_verdict,
             "notes": notes,
         }
         return to_py({"contrastcheck": {"results": [result]}})

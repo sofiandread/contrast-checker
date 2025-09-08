@@ -6,7 +6,7 @@ import io, math, urllib.request, json
 import numpy as np
 from PIL import Image
 
-app = FastAPI(title="ContrastCheck API", version="1.5.0")
+app = FastAPI(title="ContrastCheck API", version="1.6.0")
 
 # ========= Utilities =========
 
@@ -52,22 +52,20 @@ def clamp_box(x, y, w, h, W, H):
     return x, y, w, h
 
 def pil_from_url(url: str) -> Image.Image:
-    """Robust fetcher: upgrades http→https, sets UA, handles timeouts; returns RGB PIL image."""
+    """Robust fetcher: upgrades http→https, sets UA, handles timeouts; returns PIL Image (keep mode)."""
     try:
         if url.startswith("http://"):
             url = "https://" + url[len("http://"):]
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "ContrastCheck/1.5 (+fastapi)",
+                "User-Agent": "ContrastCheck/1.6 (+fastapi)",
                 "Accept": "image/*,*/*;q=0.8",
             },
         )
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = resp.read()
         img = Image.open(io.BytesIO(data))
-        if img.mode != "RGB":
-            img = img.convert("RGB")
         return img
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to load image: {e}")
@@ -76,7 +74,7 @@ def sample_region_pixels(img: Image.Image, box: Tuple[int, int, int, int], max_p
     """Return Nx3 uint8 pixels from region; downsample if region is large."""
     x, y, w, h = box
     crop = img.crop((x, y, x + w, y + h))
-    arr = np.array(crop)  # HxWx3
+    arr = np.array(crop.convert("RGB"))  # HxWx3
     H, W, _ = arr.shape
     N = H * W
     if N > max_px:
@@ -155,7 +153,26 @@ def split_border_inner(arr: np.ndarray, border_pct: float) -> Tuple[np.ndarray, 
     inner = arr[t:H - t, t:W - t, :].reshape(-1, 3)
     return border, inner
 
-# ---- New helpers for leniency / overall look ----
+# Alpha-safe cutout loaders (avoid false black borders)
+def load_cutout_rgb_from_bytes(data: bytes, bg=(255, 255, 255)) -> Image.Image:
+    im = Image.open(io.BytesIO(data))
+    if im.mode in ("RGBA", "LA"):
+        base = Image.new("RGBA", im.size, (*bg, 255))
+        im = Image.alpha_composite(base, im.convert("RGBA")).convert("RGB")
+    else:
+        im = im.convert("RGB")
+    return im
+
+def load_cutout_rgb_from_url(url: str, bg=(255, 255, 255)) -> Image.Image:
+    raw = pil_from_url(url)
+    buf = io.BytesIO()
+    # preserve alpha if present
+    fmt = "PNG" if (raw.mode in ("RGBA", "LA")) else "JPEG"
+    raw.save(buf, format=fmt)
+    buf.seek(0)
+    return load_cutout_rgb_from_bytes(buf.getvalue(), bg)
+
+# ---- Leniency / overall-look helpers ----
 
 def coverage_adjusted_threshold(pct: float, base: float, floor: float = 2.2) -> float:
     """
@@ -213,20 +230,19 @@ def overall_contrast_verdict(
 ) -> Tuple[str, List[str]]:
     """
     Decide pass/warn/fail for overall look.
-    - Fail only when the *overall* picture is weak or a very-low contrast color is sizable.
-    - Otherwise warn when there are some misses/borderlines.
+    - Fail only when overall is clearly weak, or a very-low contrast color covers real area.
+    - Otherwise Warn for minor/accent misses.
     """
     notes = []
-    # Severity gates (tunable)
-    MEAN_MARGIN_FAIL = 0.6      # fail if mean < base - 0.6
-    P25_MARGIN_FAIL  = 0.4      # fail if p25 < base - 0.4
-    FAIL_COVERAGE_MAX = 0.40    # fail if >40% of design is below base_min
-    EXTREME_LOW = max(2.1, base_min - 0.9)  # hard low threshold for single colors
+    # Tunable gates
+    MEAN_MARGIN_FAIL = 0.6       # fail if mean < base - 0.6
+    P25_MARGIN_FAIL  = 0.4       # fail if p25 < base - 0.4
+    FAIL_COVERAGE_MAX = 0.40     # fail if >40% of design is below base_min
+    EXTREME_LOW = max(2.0, base_min - 1.0)  # very low single color
 
-    # coverage is optional; treat missing as 0
     extreme = [p for p in g_vs_d if p["ratio"] < EXTREME_LOW and float(p.get("coverage", 0) or 0) >= 0.10]
     if extreme:
-        notes.append("one or more sizable colors are extremely low in contrast")
+        notes.append("One or more sizable colors are extremely low in contrast.")
 
     overall_fail = (
         stats["weighted_mean"] < (base_min - MEAN_MARGIN_FAIL) or
@@ -256,10 +272,10 @@ class Location(BaseModel):
     location_id: str = Field(..., description="e.g., 'front', 'back', or 'loc1'")
     design_box: Box
     garment_box: Box
-    text_boxes: Optional[List[Box]] = Field(default_factory=list)  # optional strict text checks
+    text_boxes: Optional[List[Box]] = Field(default_factory=list)  # strict text checks
 
 class Thresholds(BaseModel):
-    # Non-text thresholds
+    # Non-text thresholds (base)
     min_garment_vs_design: float = 3.0
     warn_garment_vs_design: float = 3.4
     min_intra_design: float = 2.5
@@ -285,15 +301,10 @@ class CutoutRequest(BaseModel):
     border_pct: float = 0.12
     thresholds: Optional[Thresholds] = Thresholds()
 
-# ========= Routes =========
-
-@app.get("/")
-def root():
-    return {"ok": True, "endpoints": ["/contrastcheck_upload", "/contrastcheck_cutout", "/contrastcheck", "/docs"]}
+# ========= Shared helpers =========
 
 def build_checks(g_rgb, g_hex, design_palette, thresholds):
-    """Common garment-vs-design checks with coverage-aware thresholds and stats."""
-    # add hex/luminance to design swatches
+    """Garment↔design checks with coverage-aware thresholds + overall stats."""
     for c in design_palette:
         c["hex"] = to_hex(tuple(c["rgb"]))
         c["luminance"] = float(round(relative_luminance(tuple(c["rgb"])), 6))
@@ -317,6 +328,7 @@ def build_checks(g_rgb, g_hex, design_palette, thresholds):
     return g_vs_d, stats
 
 def text_checks(img: Image.Image, boxes: List[Box], g_rgb: Tuple[int,int,int], thresholds: Thresholds, W: int, H: int):
+    """Strict text checks — no leniency."""
     out = []
     for tb in (boxes or []):
         tx, ty, tw, th = clamp_box(tb.x, tb.y, tb.w, tb.h, W, H)
@@ -335,10 +347,16 @@ def text_checks(img: Image.Image, boxes: List[Box], g_rgb: Tuple[int,int,int], t
             })
     return out
 
+# ========= Routes =========
+
+@app.get("/")
+def root():
+    return {"ok": True, "endpoints": ["/contrastcheck_upload", "/contrastcheck_cutout", "/contrastcheck", "/docs"]}
+
 # ---- BOX MODE (image URL + boxes) ----
 @app.post("/contrastcheck")
 def contrastcheck(req: RequestBoxMode):
-    img = pil_from_url(req.image_url)
+    img = pil_from_url(req.image_url).convert("RGB")
     W, H = img.size
     results = []
 
@@ -362,7 +380,7 @@ def contrastcheck(req: RequestBoxMode):
 
         g_vs_d, stats = build_checks(g_rgb, g_hex, design_palette, req.thresholds)
 
-        # intra design pairs (kept for notes; do NOT fail unless extremely low and large)
+        # intra (notes only)
         intra = []
         dp = [{"hex": to_hex(tuple(c["rgb"])), "rgb": c["rgb"]} for c in design_palette]
         for i in range(len(dp)):
@@ -376,15 +394,13 @@ def contrastcheck(req: RequestBoxMode):
         text_results = text_checks(img, loc.text_boxes, g_rgb, req.thresholds, W, H)
         text_fail = [p for p in text_results if not p["pass"]]
 
-        # overall verdict (individual misses become suggestions)
+        # overall verdict (only text or obvious overall issues can fail)
         overall_verdict, overall_notes = overall_contrast_verdict(
             g_vs_d, stats, req.thresholds.min_garment_vs_design
         )
-
-        # if text fails → fail regardless of overall
         final_verdict = "fail" if text_fail else overall_verdict
 
-        # suggestions from individual misses (top 3), but do not mark as fail unless overall said so
+        # suggestions from individual misses
         misses = [p for p in g_vs_d if p["ratio"] < p["required"]]
         suggestions = [
             f"Improve contrast for {p['designHex']} vs {g_hex} (ratio {p['ratio']:.3f} < {p['required']:.1f})"
@@ -406,8 +422,8 @@ def contrastcheck(req: RequestBoxMode):
             "garment": {"rgb": list(g_rgb), "hex": g_hex, "luminance": float(round(g_lum, 6))},
             "designPalette": design_palette,
             "contrast": {
-                "garmentVsDesign": g_vs_d,           # informational; NOT used to fail unless extreme
-                "intraDesignPairs": intra,           # informational
+                "garmentVsDesign": g_vs_d,           # informational only
+                "intraDesignPairs": intra,           # informational only
                 "overallStats": stats,
                 "textChecks": text_results
             },
@@ -422,7 +438,8 @@ def contrastcheck(req: RequestBoxMode):
 @app.post("/contrastcheck_cutout")
 def contrastcheck_cutout(req: CutoutRequest):
     try:
-        img = pil_from_url(req.cutout_url).convert("RGB")
+        # alpha-safe load to avoid fake black borders
+        img = load_cutout_rgb_from_url(req.cutout_url, bg=(255, 255, 255))
         arr = np.array(img)
         border_px, inner_px = split_border_inner(arr, req.border_pct)
 
@@ -438,7 +455,7 @@ def contrastcheck_cutout(req: CutoutRequest):
 
         g_vs_d, stats = build_checks(g_rgb, g_hex, design_palette, req.thresholds)
 
-        # intra pairs (notes only)
+        # intra (notes only)
         intra = []
         dp = [{"hex": to_hex(tuple(c["rgb"])), "rgb": c["rgb"]} for c in design_palette]
         for i in range(len(dp)):
@@ -509,7 +526,8 @@ async def contrastcheck_upload(
                 raise HTTPException(400, f"Invalid thresholds_json: {e}")
 
         data = await upload.read()
-        img = Image.open(io.BytesIO(data)).convert("RGB")
+        # alpha-safe composite (avoid black border)
+        img = load_cutout_rgb_from_bytes(data, bg=(255, 255, 255))
         arr = np.array(img)
         border_px, inner_px = split_border_inner(arr, float(border_pct))
 
@@ -523,13 +541,15 @@ async def contrastcheck_upload(
         if not design_palette:
             raise HTTPException(400, "Unable to derive design palette from inner area")
 
-        # Build checks + overall verdict
-        class TObj:  # tiny shim so we can reuse build_checks
-            min_garment_vs_design=float(t["min_garment_vs_design"])
-            warn_garment_vs_design=float(t["warn_garment_vs_design"])
-            min_intra_design=float(t["min_intra_design"])
-            min_text_vs_garment=float(t["min_text_vs_garment"])
-            warn_text_vs_garment=float(t["warn_text_vs_garment"])
+        # Reuse build_checks with a tiny thresholds shim
+        class TObj:
+            min_garment_vs_design = float(t["min_garment_vs_design"])
+            warn_garment_vs_design = float(t["warn_garment_vs_garment"]) if "warn_garment_vs_garment" in t else float(t["warn_garment_vs_garment"]) if "warn_garment_vs_garment" in t else float(t["warn_garment_vs_garment"])  # defensive
+        # Fallback properly (above line may be too defensive; provide explicit values)
+        TObj.warn_garment_vs_design = float(t.get("warn_garment_vs_design", t["min_garment_vs_design"]))
+        TObj.min_intra_design = float(t["min_intra_design"])
+        TObj.min_text_vs_garment = float(t["min_text_vs_garment"])
+        TObj.warn_text_vs_garment = float(t["warn_text_vs_garment"])
 
         g_vs_d, stats = build_checks(g_rgb, g_hex, design_palette, TObj)
 

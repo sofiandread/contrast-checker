@@ -500,14 +500,26 @@ async def contrastcheck_upload(
         raise HTTPException(status_code=400, detail=f"Processing error: {e}")
 
 # ---- UPLOAD MODE (batch: multiple files) ----
+# ---- UPLOAD MODE (batch: multiple files) ----
 @app.post("/contrastcheck_upload_batch")
 async def contrastcheck_upload_batch(
-    files: List[UploadFile] = File(..., description="Repeat 'files' field for each cutout"),
+    files: List[UploadFile] | None = File(None, description="Repeat 'files' for each cutout"),
+    cutout: List[UploadFile] | None = File(None, description="Legacy name; supported"),
+    file: List[UploadFile] | None = File(None, description="Legacy name; supported"),
     cutout_ids_json: Optional[str] = Form(None),
     border_pct: float = Form(0.12),
     thresholds_json: Optional[str] = Form(None),
 ):
     try:
+        # merge any provided field name into a single list
+        uploads: List[UploadFile] = []
+        for grp in (files, cutout, file):
+            if grp:
+                uploads.extend(grp)
+        if not uploads:
+            raise HTTPException(400, "No files uploaded. Use 'files' (preferred) or 'cutout'/'file'.")
+
+        # thresholds (same as before)
         t = {
             "min_garment_vs_design": 3.0, "warn_garment_vs_design": 3.4, "min_intra_design": 2.5,
             "min_text_vs_garment": 3.4, "warn_text_vs_garment": 4.0,
@@ -518,10 +530,8 @@ async def contrastcheck_upload_batch(
 
         cutout_ids = []
         if cutout_ids_json:
-            try:
-                cutout_ids = list(json.loads(cutout_ids_json))
-            except Exception as e:
-                raise HTTPException(400, f"Invalid cutout_ids_json: {e}")
+            try: cutout_ids = list(json.loads(cutout_ids_json))
+            except Exception as e: raise HTTPException(400, f"Invalid cutout_ids_json: {e}")
 
         class TObj:
             min_garment_vs_design=float(t["min_garment_vs_design"])
@@ -531,28 +541,35 @@ async def contrastcheck_upload_batch(
             warn_text_vs_garment=float(t["warn_text_vs_garment"])
 
         out_results = []
-        for idx, upload in enumerate(files):
+        for idx, upload in enumerate(uploads):
             data = await upload.read()
             img = load_cutout_rgb_from_bytes(data, bg=(255, 255, 255))
             arr = maybe_downscale_array(np.array(img))
             border_px, inner_px = split_border_inner(arr, float(border_pct))
+
             garment_palette = kmeans_palette(border_px, k_min=1, k_max=3)
             if not garment_palette: raise HTTPException(400, "Unable to derive garment palette from border")
             g_rgb = tuple(garment_palette[0]["rgb"]); g_hex = to_hex(g_rgb); g_lum = relative_luminance(g_rgb)
+
             design_palette = kmeans_palette(inner_px, k_min=2, k_max=8)
             if not design_palette: raise HTTPException(400, "Unable to derive design palette from inner area")
+
             g_vs_d, stats = build_checks(g_rgb, g_hex, design_palette, TObj)
+
             if (stats["weighted_mean"] >= (TObj.min_garment_vs_design - FAST_PASS_MEAN_MARGIN) and
                 stats["fail_coverage"] <= FAST_PASS_FAILCOV_MAX):
                 verdict = "pass"
             else:
                 verdict, _ = overall_contrast_verdict(g_vs_d, stats, TObj.min_garment_vs_design)
+
             misses = [p for p in g_vs_d if p["ratio"] < p["required"]]
             suggestions = [f"Improve contrast for {p['designHex']} vs {g_hex} (ratio {p['ratio']:.3f} < {p['required']:.1f})"
                            for p in sorted(misses, key=lambda x: x["ratio"])[:3]]
+
             notes = []
             if suggestions: notes.append("Suggestions: " + "; ".join(suggestions))
             notes.append(f"Overall stats: mean={stats['weighted_mean']}, p25={stats['weighted_p25']}, failing_coverage={stats['fail_coverage']}")
+
             out_results.append({
                 "cutout_id": cutout_ids[idx] if idx < len(cutout_ids) else None,
                 "filename": upload.filename,
@@ -568,6 +585,7 @@ async def contrastcheck_upload_batch(
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Processing error: {e}")
+
 
 # ---- CUTOUT MODE (batch: multiple URLs) ----
 @app.post("/contrastcheck_cutout_batch")
